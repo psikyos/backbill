@@ -1,24 +1,48 @@
 /********************************************************************
  bbp.pc                  
 
- 程序名: 住院收费后台划价程序（Windows版本）
+ 程序名: 住院收费后台划价程序（Windows版本、Linux版本）
 
  功能: 对住院病人医嘱及在病房费用划价汇总
 
- 作者: 薛万国 吉同路
+ 作者: 薛万国 吉同路 王君
+ Proudly Present
 
+ 更改: 修定Win版2022-02-07,支持Linux(gcc on rhel 6.2)2022-02-14.
+1.增加首日床位费;
+2.床位gcBedClass为动态变量;item_code为动态变量.
+3.处理itoa,stritoa,stricmp,strnicmp,替换为sprintf,strcasecmp,strncasecmp.兼容Linux.
+4.增加file_format函数,以判断传入的ini文件格式.
+5.2022.02.14,修正GetConfigString,以支持Windows、Linux(represented by win、lnx repectively)的文件格式.ini处理文件暂不支持mac的文件格式.
+6.修正get_column_length,避免proc出现编译问题.
+linux下proc通过:
+proc iname=BBP.PC
+gcc BBP.c -o backbill -I $ORACLE_HOME/precomp/public -L $ORACLE_HOME/lib -l clntsh
+
+win下proc,vs环境vs2005.vc98通过。
+2022年2月15日以后版本使用：proc iname=bbp.pc
+或者使用
+proc parse=full iname=bbp.pc include="E:\Program Files\Microsoft Visual Studio\VC98\Include"
+编译：
+cl bbp.c -I"%VCINSTALLDIR%\include" -I "%ORACLE_HOME%\precomp\public" /link %ORACLE_HOME%\precomp\lib\orasql10.lib
+或者编译阶段使用vs2010
  日期: 1998-03-10
 **********************************************************************/
 
+#ifdef _WIN32
 #include <windows.h> 
+#endif
+
 #include <string.h>
 #include <stdio.h> 
 #include <math.h>  
 #include <stdarg.h>
-#include "sqlproto.h"
-#include "bbp.h"
-#include "common.h"
-#include "sqlcon.h"
+
+/*#include "SQLPROTO.H"*/
+#include "BBP.H"
+#include "COMMON.H"
+#include "SQLCON.H"
+
 
 
 EXEC SQL INCLUDE SQLCA.H;
@@ -42,7 +66,9 @@ EXEC SQL BEGIN DECLARE SECTION;
 	short		ind_WardCode;			/*指示变量*/
 	short		gnBedNo;				/*床号*/ 
 	short		ind_BedNo;				/*指示变量*/
-	VARCHAR		gcBedClass[3];			/*床位等级*/
+//	VARCHAR		gcBedClass[3];			/*床位等级*/
+	//VARCHAR		gcBedClass[41];			/*床位等级*/
+	VARCHAR		*gcBedClass;			/*床位等级*/
 	short		ind_BedC;				/*床位等级指示变量*/
 	short		gnChargeIndicator;		/*费别对应的适用价格*/
 	VARCHAR		gcChargeType[9];		/*费别 */
@@ -119,6 +145,7 @@ int		gnDietBill ;				/*膳食医嘱(0 不根据医嘱划伙食费;1 根据医嘱划伙食费 */
 int		gnExamBill;					/*检查类医嘱(0 不根据医嘱计价,1 根据医嘱计价*/
 int		gnLabBill;					/*检验类医嘱(0 不根据医嘱计价,1 根据医嘱计价*/
 int		gnOperBill;					/*手术类医嘱(0 不根据医嘱计价,1 根据医嘱计价*/
+int		gnBedFirstDayMode;			/*入院第一天,床位费是否取整(0,不计价;1,计费且不取整,即小数;2,计费且取整)*/
 int		loglevel;					/*日志文件记录内容:0-简要 1-明细 */
 
 char	cmdstr[80];					/*命令行*/          
@@ -142,6 +169,11 @@ char szTitle[ MAX_TITLE_STRING + 1 ];
 #define MINSTR(a,b) (strcmp(a,b)<0?a:b)
 #define SELE(a,b,c,d) (strcmp(a,b)==0?c:d)
 
+/*defined by wangjun*/
+#define BED_FIRST_DAY_CEIL 2 /*首日床位费取整*/
+#define BED_FIRST_DAY_FLOAT 1/*首日床位费保持浮点数*/
+#define BED_FIRST_DAY_NO_BILL 0 /*首日床位费,不处理0.x的首日床位费*/
+
 /*与医嘱直接相关的处理函数*/
 int		billmain(int argc ,char *argv[]);
 int		bill_pats(int nAcctMode);
@@ -161,225 +193,62 @@ int		analy_perform_schedule ( char *schd_str, struct time_st *tp );
 int		count_point ( char *start_time, char *stop_time, char *schd_str );
 int		convert_time_str ( char *time_str, struct time_st *time_int );
 
-long FAR PASCAL BillWndProc(HWND, unsigned, WORD, LONG);
+//long FAR PASCAL BillWndProc(HWND, unsigned, WORD, LONG);
 
-BOOL	BillInit(HANDLE);
+//BOOL	BillInit(HANDLE);
 
-FARPROC	lpprocAbout;
-static	HANDLE hInst;
-HWND	hwndMain;
+//added by wangjun
+short get_column_length(char *table_name,char *owner,char *column_name);
+int file_format(FILE *cfp);
+//FARPROC	lpprocAbout;
+//static	HANDLE hInst;
+//HWND	hwndMain;
 
 
 /********************************************************************/
 /*                   Pro*C and Windows Code.                        */
 /********************************************************************/
 
-BOOL FAR PASCAL AboutDlg(hDlg, message, wParam, lParam)
-HWND hDlg;
-unsigned message;
-WORD wParam;
-LONG lParam;
+/*在此处申请bed_class的内存空间*/
+VARCHAR *allocate_bed_class(short bed_class_length)
 {
+	if(bed_class_length>0)
+	{	//gcBedClass是全局变量
+		gcBedClass=(VARCHAR *)malloc(sizeof(short)*(bed_class_length+1));
+		gcBedClass->len=bed_class_length+1;
+		gcBedClass->arr[gcBedClass->len]='\0';/*因为长度不定,所以要设置结束符*/
 
-    switch (message) {
+	}
+	else
+		printf("Get bed class length failed.\n");
+	return gcBedClass;//操作全局变量,此处可以不用返回
+}
 
-        case WM_COMMAND :
-            EndDialog(hDlg, TRUE);
-            return(TRUE);
-
-        case WM_INITDIALOG :
-            return(TRUE);
-
-        default :
-            return(FALSE);
-        } /*switch*/
-
-
-} /*AboutDlg*/
-
-/**********************************************************************
-  BillInit
- 
-  应用程序初始化.
-***********************************************************************/
-BOOL BillInit(in_hInst)
-HANDLE in_hInst;
+/*在此处申请item_code的内存空间*/
+VARCHAR *allocate_item_code(short item_code_length)
 {
-    WNDCLASS bwc;
+	VARCHAR *loc_lcItemCode=NULL;
+	if(item_code_length>0)
+	{	//lcItemCode是全局变量
+		loc_lcItemCode=(VARCHAR *)malloc(sizeof(short)*(item_code_length+1));
+		loc_lcItemCode->len=item_code_length+1;//带上截止符的长度
+		loc_lcItemCode->arr[loc_lcItemCode->len]='\0';/*因为长度不定,所以要设置结束符*/
+	}
+	else
+		printf("Get item code length failed.\n");
+	return loc_lcItemCode;//返回申请的空间
+}
 
-    /* Load strings from resource */
-    LoadString(in_hInst, IDS_ABOUT, (LPSTR)szAbout, MAX_ABOUT_STRING);
-    LoadString(in_hInst, IDS_APPNAME, (LPSTR)szAppName, MAX_APPNAME_STRING);
-    LoadString(in_hInst, IDS_MENU,
-                                (LPSTR)szMenu, MAX_MENU_STRING);
-    LoadString(in_hInst, IDS_TITLE, (LPSTR)szTitle, MAX_TITLE_STRING);
-
-    bwc.style = CS_HREDRAW | CS_VREDRAW;
-    bwc.lpfnWndProc = BillWndProc;
-    bwc.cbClsExtra = 0;
-    bwc.cbWndExtra = 0;
-    bwc.hInstance = in_hInst;
-    bwc.hIcon = LoadIcon(in_hInst, (LPSTR)szAppName);
-    bwc.hCursor = LoadCursor(NULL, IDC_ARROW);
-    bwc.hbrBackground = (HBRUSH)GetStockObject( WHITE_BRUSH );
-    bwc.lpszMenuName = (LPSTR)szMenu;
-    bwc.lpszClassName = (LPSTR)szAppName;
-
-    if (!RegisterClass((LPWNDCLASS)&bwc))
-        return FALSE;
-
-    return( TRUE );
-
-} /*BillInit*/
-
-/**********************************************************************
-  WinMain
- 
-  主程序
-***********************************************************************/
-int PASCAL WinMain( hInstance, hPrevInstance, lpszCmdLine, cmdShow )
-HANDLE hInstance, hPrevInstance;
-LPSTR lpszCmdLine;
-int cmdShow;
+int main(int argc ,char *argv[])
 {
-/*    HMENU hmenuSystem, hmenuSample;  */
-    HWND hWnd;
-    MSG msg;
-
-    if (hPrevInstance)
-        return( FALSE );
-
-    if (!BillInit(hInstance))
-        return( FALSE );  
-    
-	/*分解命令行参数*/
-    strcpy(cmdstr,lpszCmdLine);  
-    parastr[0]=NULL;
-	parac = 1;
-    parastr[1] = strtok(cmdstr," ");
-    if (parastr[1] != NULL )
-    	{
-        parac ++;
-    	parastr[2] = strtok(NULL," ");
-		if (parastr[2] != NULL )
-        	parac ++;
-        }
-        
-    hInst = hInstance;  
-      
-
-/*    hmenuSample = LoadMenu(hInst, "MENU"); */    
-
-    hwndMain = hWnd = CreateWindow((LPSTR)szAppName,
-                        (LPSTR)szTitle,
-                        WS_OVERLAPPEDWINDOW|WS_VSCROLL,
-                        CW_USEDEFAULT,
-                        CW_USEDEFAULT,
-                        CW_USEDEFAULT,
-                        CW_USEDEFAULT,
-                        (HWND)NULL,
-                        (HMENU)NULL,
-                        (HANDLE)hInst,
-                        (LPSTR)NULL);
-
-    lpprocAbout = MakeProcInstance((FARPROC)AboutDlg, hInst);     
-/*    hmenuSystem = GetSystemMenu(hWnd, FALSE);
-    InsertMenu(hmenuSystem, 0, MF_BYPOSITION | MF_STRING, IDS_ABOUT,
-                                                            (LPSTR)szAbout);
-*/
-    ShowWindow(hWnd, SW_SHOWNORMAL);
-    UpdateWindow(hWnd);  
-   
-    while (GetMessage((LPMSG)&msg, NULL, 0, 0)) {
-        TranslateMessage((LPMSG)&msg);
-        DispatchMessage((LPMSG)&msg);
-        } /*while*/
-
-    return( (int)msg.wParam );
-
-} /*WinMain*/
-
-/**********************************************************************
-  BillWndProc
- 
-  主窗口函数
-***********************************************************************/
-long FAR PASCAL BillWndProc(hWnd, message, wParam, lParam)
-
-HWND hWnd;
-unsigned message;
-WORD wParam;
-LONG lParam;
-{
-	static HWND hInst;  
-	HDC hdc;
-	int x,y,h;
-	TEXTMETRIC tm;
-	HCURSOR hHourGlass,hSaveCursor;
-
-	switch (message) {
-
-		case WM_CREATE :
-			hInst = ((LPCREATESTRUCT) lParam)->hInstance;
-			PostMessage(hWnd,WM_USER,0,0);
-			return TRUE; 
-            
-		case WM_USER :
-			hdc = GetDC(hWnd);
-			x=y=0;
-			GetTextMetrics(hdc,&tm);
-			h=tm.tmHeight;
-			TextOut(hdc,x,y,"开始计价...",11);
-			ReleaseDC(hWnd,hdc);
-			hHourGlass = LoadCursor(NULL,IDC_WAIT);
-			SetCapture(hWnd);
-			hSaveCursor = SetCursor(hHourGlass); 
-			billmain(parac,parastr);
-			SetCursor(hSaveCursor );
-			ReleaseCapture();   
-			SendMessage(hWnd, WM_CLOSE, 0, 0L);    
-			break;
-        
-        
-		case WM_SYSCOMMAND :
-
-			switch (wParam) {
-				default:
-					break;
-				} /*switch*/
-			break;
-
-		case WM_COMMAND :
-			if (LOWORD(lParam) == 0) {    /*message from a menu*/
-
-				switch (wParam) {
-
-					case IDM_EXIT :
-						SendMessage(hWnd, WM_CLOSE, 0, 0L);    
-						return( TRUE );
-
-					default :
-						break;
-					} /*switch*/
-				} /*if*/
-			break;
-
-		case WM_CLOSE :
-			break; /* Let this pass thru so default operation can occur. */
-
-		case WM_DESTROY :
-			PostQuitMessage(0);
-			break;
-
-		default:
-			break;
-		} /*switch*/
-
-	/* Performs default operation. */
-	return( DefWindowProc(hWnd, message, wParam, lParam) );
-
-} /*BillWndProc*/
-
+	int result;
+	printf("Backbill modified by Wang Jun.\nComplied with Oracle 10g/11g 32bit On 2022.02.07. Linux On 2022.02.14.\n");
+	result=billmain(argc,argv);
+	if(result==0)
+		printf("Succeed.");
+//	getch();
+	return 0;
+}
 
 /********************************************************************
  int billmain(int argc ,char *argv[])
@@ -393,9 +262,9 @@ int billmain(int argc ,char *argv[])
 {
 	char	lcpath[64];					/*配置文件路径环境变量 */
 	char	*sp;						/*环境变量值*/
-	int		nAcctMode;					/*计价模式:0-定时计价,1-随机计价 */
+	int		nAcctMode;					/*计价模式:0-定时计价,1-随机计价,2-按科室定时计价 */
 	int		bill_status;				/*计价返回状态*/
-    
+    short	bed_class_length;
 
 	/*打开日志文件*/
 	if(argc==1)							/*定时启动*/
@@ -421,40 +290,59 @@ int billmain(int argc ,char *argv[])
 		strcpy(lcpath,"BACKBILL.INI");
 
 	/*取配置参数*/
-	gnPharmBill=GetConfigNum(lcpath,"BACK_BILL","pharm_bill",1);	/*药品类医嘱计价标志*/
+	gnPharmBill=GetConfigNum(lcpath,"BILL_SOURCE","pharm_bill",1);	/*药品类医嘱计价标志*/
 	if (gnPharmBill>0)
 		gnPharmBill=1;
 
-	gnDietBill=GetConfigNum(lcpath,"BACK_BILL","diet_bill",0);		/*膳食类医嘱计价标志*/
+	gnDietBill=GetConfigNum(lcpath,"BILL_SOURCE","diet_bill",0);		/*膳食类医嘱计价标志*/
 	if (gnDietBill>0)
 		gnDietBill=1;
 
-	gnExamBill=GetConfigNum(lcpath,"BACK_BILL","exam_bill",1);		/*检查类医嘱计价标志*/
+	gnExamBill=GetConfigNum(lcpath,"BILL_SOURCE","exam_bill",1);		/*检查类医嘱计价标志*/
 	if (gnExamBill>0)
 		gnExamBill=1;
 
-	gnLabBill=GetConfigNum(lcpath,"BACK_BILL","lab_bill",1);		/*检验类医嘱计价标志*/
+	gnLabBill=GetConfigNum(lcpath,"BILL_SOURCE","lab_bill",1);		/*检验类医嘱计价标志*/
 	if (gnLabBill>0)
 		gnLabBill=1;
 
-	gnOperBill=GetConfigNum(lcpath,"BACK_BILL","oper_bill",0);		/*手术类医嘱计价标志*/
+	gnOperBill=GetConfigNum(lcpath,"BILL_SOURCE","oper_bill",0);		/*手术类医嘱计价标志*/
 	if (gnOperBill>0)
 		gnOperBill=1;
 
-	GetConfigString(lcpath,"BACK_BILL","bill_time","18",gcBillTime.arr,3);	/*计价时间*/
+	gnBedFirstDayMode=GetConfigNum(lcpath,"BILL_SOURCE","bed_first_day_mode",0);	/*入院第一天,是否收床位费,以及床位费是否取整.0,不计费;1,计费且不取整,即小数;2,计价取整*/
+
+	GetConfigString(lcpath,"GENERAL","bill_time","18",gcBillTime.arr,3);	/*计价时间*/
 	if ( atoi(gcBillTime.arr)>23|| atoi(gcBillTime.arr)==0)
 		strcpy(gcBillTime.arr,"18");						/*默认值为18点*/
 		gcBillTime.len=strlen(gcBillTime.arr);
+	printf("default bill time:%s\n",gcBillTime.arr);
+	fprintf(fp,"默认划价时间:%s\n",gcBillTime.arr);
 
-	GetConfigString(lcpath,"BASE_COND","pre_bill_time",(char *)NULL,PreBillDT.arr,16);	/*取上次批量计价时间*/
+	/*GetConfigString(lcpath,"BASE_COND","pre_bill_time",(char *)NULL,PreBillDT.arr,16);*/	/*取上次批量计价时间*/
+	GetConfigString(lcpath,"GENERAL","last_bill_time","1970-01-01 01:00",PreBillDT.arr,16);
 	PreBillDT.len=strlen(PreBillDT.arr);
+	printf("previous bill time:%s\n",PreBillDT.arr);
+	fprintf(fp,"上次划价时间:%s\n",PreBillDT.arr);
 
 	/*数据库配置*/
 	GetConfigString(lcpath,"DATABASE","user","",username.arr,40);
 	GetConfigString(lcpath,"DATABASE","password","",password.arr,12);
 	GetConfigString(lcpath,"DATABASE","server","",server.arr,40);
 	
-	loglevel=GetConfigNum(lcpath,"BASE_COND","log_level",0);		/*取日志记录内容*/
+	loglevel=GetConfigNum(lcpath,"GENERAL","log_level",0);		/*取日志记录内容,0 as default*/
+	printf("log level:%d\n",loglevel);
+	fprintf(fp,"日志详细级(log level):%d\n",loglevel);
+	printf("argc:%d\n",argc);
+	fprintf(fp,"argc:%d\n",argc);
+	if(argc==2)
+	{
+		fprintf(fp,"argv[1]:%s\n",argv[1]);
+	}
+	else if(argc==3)
+	{
+		fprintf(fp,"argv[1]:%s.argv[2]:%s\n",argv[1],argv[2]);
+	}
 
 	username.len = strlen(username.arr);
 	password.len = strlen(password.arr);
@@ -464,24 +352,42 @@ int billmain(int argc ,char *argv[])
 	EXEC SQL CONNECT :username IDENTIFIED BY :password USING :server;
 	if(sqlca.sqlcode!=0)
 		{
-		fprintf(fp,"向ORACLE登录失败,错误码=%d\n",sqlca.sqlcode);
+		printf("%s向ORACLE:%s登录失败,错误码=%d\n",username.arr,server.arr,sqlca.sqlcode);
+		fprintf(fp,"%s向ORACLE%s登录失败,错误码=%d\n",username.arr,server.arr,sqlca.sqlcode);		
 		fclose(fp);
 		return(-1);
-		} 
-		
+		}
+
+	//printf("application debug terminated by wangjun.\n");
+	//return -1;
+	/*取得gcBedClass长度*/
+	bed_class_length=get_column_length("BED_REC","INPADM","BED_CLASS");
+	allocate_bed_class(bed_class_length);
+	gcBedClass->len=bed_class_length+1;//带上截止符的长度
+	gcBedClass->arr[gcBedClass->len]='\0';
+	/*取得ItemCode长度*/
+/*	item_code_length=get_item_code_length();
+	allocate_item_code(item_code_length);
+	lcItemCode->len=item_code_length+1;//带上截止符的长度
+	lcItemCode->arr[lcItemCode->len]='\0';
+*/
 	/*获取当前时间*/
 	EXEC SQL SELECT TO_CHAR(SYSDATE,'YYYY-MM-DD HH24:MI:SS')
 					INTO :BillDT FROM DUAL;
 	if (sqlca.sqlcode == 0)
 		{
 		BillDT.arr[BillDT.len]='\0';
+		printf("开始时间:%s\n",BillDT.arr);
 		fprintf(fp,"开始时间:%s\n",BillDT.arr);
 		}
+	/*backbill.exe,1个参数,nAcctMode=0,
+	backbill.exe d,2个参数.nAcctMode=2,对指定科室病人计价
 
+	*/
 	/*处理命令行参数，决定计价模式*/
 	switch (argc)
 		{
-		case 1:			/*对所有病人定时计价*/
+		case 1:			/*backbill.exe,对所有病人定时计价*/
 			nAcctMode=0; 
 			bill_status = bill_pats(nAcctMode);
 			break;
@@ -493,12 +399,12 @@ int billmain(int argc ,char *argv[])
 				bill_status = bill_pats(nAcctMode);
 				}
 			else
-				if (strcmp(argv[1],"d") == 0 || strcmp(argv[1],"D") == 0)	/*对指定科室病人计价*/
+				if (strcmp(argv[1],"d") == 0 || strcmp(argv[1],"D") == 0)	/*backbill d,对指定科室病人计价*/
 					{
 					nAcctMode=2;
 					bill_status = bill_pats(nAcctMode);
 					} 
-				else
+				else/*对所有待计价病人随机计价*/ 
 					{
 					nAcctMode=1;
 					bill_status = bill_pats(nAcctMode);
@@ -507,8 +413,10 @@ int billmain(int argc ,char *argv[])
 			
 		case 3:			/*对指定病人计价*/
 			nAcctMode=3;
-			/*获取当前计价时间*/
-			EXEC SQL SELECT TO_CHAR(SYSDATE,'YYYY-MM-DD HH24:MI')
+			/*获取当前计价时间,不再使用
+			EXEC SQL SELECT TO_CHAR(SYSDATE,'YYYY-MM-DD HH24:MI')*/
+			/*获取定时计价时间并记录日志*/
+			EXEC SQL SELECT TO_CHAR(SYSDATE,'YYYY-MM-DD')||' '||:gcBillTime||':'||'00'
 							INTO :BillDT FROM DUAL;
 			BillDT.arr[BillDT.len]='\0';
 
@@ -523,9 +431,12 @@ int billmain(int argc ,char *argv[])
 		
 
 	/*记录本次计价时间*/
-	if (nAcctMode==0 && bill_status==0)
-		SetConfigString(lcpath,"BASE_COND","pre_bill_time",BillDT.arr); 
-	
+	//if (nAcctMode==0 && bill_status==0)
+	if(bill_status==0)
+		SetConfigString(lcpath,"GENERAL","last_bill_time",BillDT.arr);
+	fprintf(fp,"pre_nAcct_Mode:%d\n",nAcctMode);
+	/*SetConfigString(lcpath,"BASE_COND","pre_nAcct_Mode",nAcctMode);记录划价模式*/
+
 	if (bill_status < 0)
 		fprintf(fp,"\n错误! 计价程序非正常终止\n");
 
@@ -540,8 +451,9 @@ int billmain(int argc ,char *argv[])
 
 	EXEC SQL ROLLBACK WORK RELEASE;
 	fclose(fp);
-	fclose(errfp);
-
+	fclose(errfp);	
+	free(gcBedClass);/*释放gcBedClass*/
+//	free(lcItemCode);/*释放itemcode*/
 	return (bill_status);
   }
    
@@ -706,7 +618,7 @@ int bill_a_pat(char *patient_id)
 	if ( sqlca.sqlcode != 0 )
 		{
 		fprintf(errfp,"病人ID:%s\n",gcPatientID.arr);
-		fprintf(errfp,"取病人在院信息出错,错误码=%d\n",sqlca.sqlcode);
+		fprintf(errfp,"取病人在院信息出错,错误码=%d\n",sqlca.sqlcode);/*1403,NO DATA FOUND*/
 		return(-1);
 		}
 
@@ -835,6 +747,8 @@ int bill_a_pat(char *patient_id)
 		} 
 
 	EXEC SQL COMMIT;
+	/*for test purpose: EXEC SQL ROLLBACK;*/
+
 	return(0);
 
 }
@@ -1160,7 +1074,10 @@ int bill_order_items()
 	EXEC SQL BEGIN DECLARE SECTION;
 		char		lcItemClass;	/*计价项目类别*/
 		VARCHAR		lcItemName[41];	/*计价项目名称*/
-		VARCHAR		lcItemCode[11];	/*计价项目代码*/
+//		VARCHAR		lcItemCode[11];	/*计价项目代码*/
+//		VARCHAR		lcItemCode[41];	/*计价项目代码*/
+		VARCHAR		*lcItemCode;			/*计价项目代码,wangjun*/
+		short		item_code_length;		/*计价项目代码的长度,wangjun*/
 		VARCHAR		lcItemSpec[21];	/*计价项目规格*/
 		short		ind_lnSpec;		/*计价项目规格指示变量*/
 		VARCHAR		lcUnits[9];		/*计价项目单位*/
@@ -1171,7 +1088,9 @@ int bill_order_items()
 
 		/*以下变量用于价表*/
 		char		lcClass;		/*项目类别*/
-		VARCHAR		lcCode[11];		/*项目代码*/
+//		VARCHAR		lcCode[11];		/*项目代码*/
+		VARCHAR		*lcCode;		/*项目代码*/
+		short		code_length;	/*项目代码长度*/
 		VARCHAR		lcSpec[21];		/*项目规格*/
 		short		ind_Spec;		/*项目规格指示变量*/
 		VARCHAR		lcUnt[9];		/*计价单位*/
@@ -1195,6 +1114,14 @@ int bill_order_items()
 		double		lnBillCosts;	/*项目费用*/
 		double		lnBillCharges;	/*项目应收费用*/
 	EXEC SQL END DECLARE SECTION;
+
+	/*处理item_code长度*/
+	item_code_length=get_column_length("ORDERS_COSTS","ORDADM","ITEM_CODE");
+	lcItemCode=allocate_item_code(item_code_length);//长度初始化,截止符已处理完
+
+	/*处理价表item_code长度*/
+	code_length=get_column_length("PRICE_LIST","COMM","ITEM_CODE");
+	lcCode=allocate_item_code(code_length);//长度初始化,截止符已处理完
 
 	/*为本条医嘱对应的计价项目定义游标*/
 	EXEC SQL DECLARE orders_costs_cursor CURSOR
@@ -1220,6 +1147,7 @@ int bill_order_items()
     /*逐条处理计价项目*/
 	while (1) 
      {
+		lcItemCode->len=item_code_length+1;//带截止符
         /*获取一条医嘱计价项目*/
         EXEC SQL FETCH orders_costs_cursor  INTO
                     :lnItemNo,:lcItemClass,:lcItemName,:lcItemCode,
@@ -1241,7 +1169,7 @@ int bill_order_items()
 				}
 			
 		lcItemName.arr[lcItemName.len]='\0';
-		lcItemCode.arr[lcItemCode.len]='\0';
+		lcItemCode->arr[lcItemCode->len]='\0';
 		lcItemSpec.arr[lcItemSpec.len]='\0';
 		lcUnits.arr[lcUnits.len]='\0';
 
@@ -1249,13 +1177,14 @@ int bill_order_items()
 		if ( ind_lnAmount == -1 ) lnAmount = 1;
 		if (loglevel>0)
 			fprintf(fp,"     --%s  类别: %c 代码: %s 规格: %s 单位: %s 数量: %5.2f\n",
-				lcItemName.arr,lcItemClass,lcItemCode.arr,lcItemSpec.arr,lcUnits.arr,lnAmount);
+				lcItemName.arr,lcItemClass,lcItemCode->arr,lcItemSpec.arr,lcUnits.arr,lnAmount);
 
 		/*如果为药品项目且配置药品从摆药单划价，则跳过*/
 		if ( gnPharmBill==0 && lcItemClass=='A')
 			continue;
 
 		/*取其对应的价表项目*/
+		lcCode->len=code_length+1;
 		EXEC SQL SELECT item_class,item_code,item_spec,units,
 						price,prefer_price,foreigner_price,performed_by
 					INTO :lcClass,:lcCode,:lcSpec:ind_Spec,:lcUnt:ind_Unt,
@@ -1276,7 +1205,7 @@ int bill_order_items()
 				fprintf(errfp,"病人ID:%s 医嘱号:%ld 子医嘱号:%d\n",gcPatientID.arr,lnOrderNo,
 								lnOrderSubNo);
 				fprintf(errfp,"价表中无对应项目,项目为:%c  %s  %s\n",
-						lcItemClass,lcItemCode.arr,lcItemSpec.arr);
+						lcItemClass,lcItemCode->arr,lcItemSpec.arr);
 				return(1);
 				}
 			else		/*出错*/
@@ -1292,11 +1221,11 @@ int bill_order_items()
 			fprintf(errfp,"病人ID:%s 医嘱号:%ld 子医嘱号:%d\n",gcPatientID.arr,lnOrderNo,
 							lnOrderSubNo);
 			fprintf(errfp,"价表中价格为空,项目为:%c  %s  %s\n",
-						lcItemClass,lcItemCode.arr,lcItemSpec.arr);
+						lcItemClass,lcItemCode->arr,lcItemSpec.arr);
 			return(1);
 			}
 
-		lcCode.arr[lcCode.len]='\0';
+		lcCode->arr[lcCode->len]='\0';
 		lcSpec.arr[lcSpec.len]='\0';
 		lcUnt.arr[lcUnt.len]='\0';
 		if (ind_PB != -1)
@@ -1448,6 +1377,8 @@ int bill_order_items()
 			}
 		}
 		}	/*while*/
+	free(lcItemCode);
+	free(lcCode);
 	return(0);
  } /*end of bill_order_items*/
 
@@ -1491,6 +1422,7 @@ int analy_order()
 	return(0);
 }	/*end of analy_order*/ 
 
+
 /********************************************************************
  int bill_bed()
  名称: 床位费计价函数
@@ -1501,9 +1433,14 @@ int analy_order()
 int bill_bed()
 {
 	EXEC SQL BEGIN DECLARE SECTION;
-		VARCHAR		LastDate[11];			/*上个计价日期（不含时间）*/
-		VARCHAR		CurrDate[11];			/*当前计价日期（不含时间）*/  
+//		VARCHAR		LastDate[11];			/*上个计价日期（不含时间）*/
+//		VARCHAR		CurrDate[11];			/*当前计价日期（不含时间）*/
+		VARCHAR		LastDate[19];			/*上个计价日期,wangjun*/
+		VARCHAR		CurrDate[19];			/*当前计价日期,wangjun*/
 		double		lnBedDays;				/*计价天数*/
+		double		float_BedDays;			/*计价天数,浮点计数,对应bed_first_day_mode参数0,wangjun*/
+		double		ceil_BedDays;			/*计价天数,在float_BedDays基础上,向上取整计数,仍是浮点数,对应bed_first_day_mode参数2,wangjun*/
+		double		floor_BedDays;			/*计价天数,在float_BedDays基础上,向下取整技术,仍是浮点数,对应bed_first_day_mode参数1,wangjun*/
 //		short		intBedDays;				/*取整后天数*/
 		double		lnPrice;				/*床位价格*/
 		short		ind_P;					/*指示变量*/
@@ -1527,8 +1464,11 @@ int bill_bed()
 		short		ind_final_cd;			/*指示变量*/
 		
 	EXEC SQL END DECLARE  SECTION;
+	int bk_bed_class_length;
+	bk_bed_class_length=gcBedClass->len;
 
 	/*获取病人的床位等级*/
+	gcBedClass->len=bk_bed_class_length;//fetch前赋值一次
 	EXEC SQL SELECT bed_class INTO :gcBedClass:ind_BedC
 				FROM bed_rec WHERE ward_code=:gcWardCode AND bed_no=:gnBedNo;
 	if (sqlca.sqlcode != 0 && sqlca.sqlcode != 1403)
@@ -1546,29 +1486,61 @@ int bill_bed()
 			}
 	if ( ind_BedC == -1 ) return(1);		/*如果无床号，直接返回*/
 
-	strncpy(CurrDate.arr,BillDT.arr,10);
-	CurrDate.len = 10;
+	gcBedClass->arr[gcBedClass->len]='\0';
+	strncpy(CurrDate.arr,BillDT.arr,BillDT.len);
+	CurrDate.len = BillDT.len;
 	CurrDate.arr[CurrDate.len] = '\0';
 	
-	/*如果是第一次计价,上次计价日期为病人入院日期*/
+	/*如果是第一次计价,上次计价日期为病人入院日期,pats_in_hospital,admission_date_time*/
 	if(ind_BDT==-1)
-		strncpy(LastDate.arr,gcAdmissionDateTime.arr,10);
-	else							/*如果非首次计价，上次计价日期为在院记录中的上次计价日期*/
-		strncpy(LastDate.arr,gcBillingDateTime.arr,10);
-	LastDate.len = 10;
+	{
+		strncpy(LastDate.arr,gcAdmissionDateTime.arr,gcAdmissionDateTime.len);
+		LastDate.len = gcAdmissionDateTime.len;
+	}
+	else							/*如果非首次计价，上次计价日期为在院记录中的上次计价日期,pats_in_hospital,billing_date_time*/
+	{
+		strncpy(LastDate.arr,gcBillingDateTime.arr,gcBillingDateTime.len);
+		LastDate.len =gcBillingDateTime.len;
+	}
+//	LastDate.len = 10;
 	LastDate.arr[LastDate.len] = '\0'; 
-	
+
 	/*计算计价天数*/
-	EXEC SQL SELECT TO_DATE(:CurrDate,'YYYY-MM-DD')-
-						TO_DATE(:LastDate,'YYYY-MM-DD')
-			INTO  :lnBedDays
-			FROM  DUAL;
+	/*没有带入时间,则不会有小数
+	研究语句:
+	285856,4月17日入院.
+	select sysdate from dual;
+select * from pats_in_hospital pih where pih.patient_id='254966';
+select * from inp_bill_detail ibd where ibd.patient_id='254966' and ibd.visit_id='7';
+*/
+	EXEC SQL select float_days,ceil(float_days),floor(float_days)
+		INTO :float_BedDays,ceil_BedDays,floor_BedDays
+		from
+		(
+		select to_date(:CurrDate,'yyyy-mm-dd hh24:mi:ss')-
+		to_date(:LastDate,'yyyy-mm-dd hh24:mi:ss') as float_days
+		from dual
+		)days_source;
+	//here comes the judgement
+	if(ind_BDT==-1&&gnBedFirstDayMode==BED_FIRST_DAY_CEIL)//如果首次计价,并且backbill.ini中参数为2,要求首天入院,床位费向上取整
+		lnBedDays=ceil_BedDays;
+	else if(ind_BDT==-1&&gnBedFirstDayMode==BED_FIRST_DAY_FLOAT)//如果首次计价,并且backbill.ini中参数为1,要求首天入院,床位费取浮点
+		lnBedDays=float_BedDays;
+	else//首次计价时,backbill.ini中参数为0.或者不是首日计价
+		lnBedDays=floor_BedDays;
+
 	if (sqlca.sqlcode!=0)
 		{
 		fprintf(errfp,"病人ID:%s\n",gcPatientID.arr);
 		fprintf(errfp,"计算床位占用天数出错,错误码=%d\n",sqlca.sqlcode);
 		return(-1);
 		}
+	//知道float_BedDays,就知道ceil和floor.再知道具体取值
+	fprintf(fp,"\n   **首次计价标志:ind_BDT(-1 for first)=%d,CurrDate:%s,LastDate:%s,float_BedDays:%f,InBedDays:%f\n",
+		ind_BDT,CurrDate.arr,LastDate.arr,float_BedDays,lnBedDays);
+	//写入gnBedFirstDayMode
+	//printf("bed_first_day_mode:%d\n",gnBedFirstDayMode);
+	fprintf(fp,"bed_day_0_mode:%d\n",gnBedFirstDayMode);
 
 //	/*天数取整*/
 //	intBedDays = (short)floor(lnBedDays+0.5) ;
@@ -1674,9 +1646,13 @@ int bill_bed()
 
 	gnItemNo = gnItemNo + 1 ;
 	if (loglevel>0)
-		fprintf(fp,"\n   **床位天数=%5.2f  床位等级=%s  总额=%5.2f\n",
-	lnBedDays,gcBedClass.arr,lnBillCosts) ;
-
+	{
+		if(ind_BDT==-1 && gnBedFirstDayMode==BED_FIRST_DAY_CEIL)/*如果是首日计价,且记录为取整*/
+			fprintf(fp,"\n   **首日取整,实际床位天数=%5.2f,取整床位天数=%5.2f  床位等级=%s  总额=%5.2f\n",float_BedDays,lnBedDays,gcBedClass->arr,lnBillCosts);
+		else
+			fprintf(fp,"\n   **床位天数=%5.2f  床位等级=%s  总额=%5.2f\n",
+			lnBedDays,gcBedClass->arr,lnBillCosts) ;
+	}
 	EXEC SQL INSERT  INTO inp_bill_detail 
 			(patient_id,visit_id,
 			item_no,item_class,item_name,item_code,item_spec,amount,units,ordered_by,
@@ -1708,7 +1684,9 @@ int bill_drug_dispense()
 	EXEC SQL BEGIN DECLARE SECTION;
 		VARCHAR		lcDispensingDT[17];		/*摆药日期及时间*/
 		VARCHAR		lcDrugName[41];			/*药品名称*/
-		VARCHAR		lcDrugCode[11];			/*药品代码*/
+//		VARCHAR		lcDrugCode[11];			/*药品代码*/
+		VARCHAR		*lcDrugCode;			/*药品代码,wangjun*/
+		short		drug_code_length;		/*药品代码长度,wangjun*/
 		VARCHAR		lcDrugSpec[21];			/*药品规格*/
 		VARCHAR		lcDrugUnits[7];			/*药品单位*/
 		VARCHAR		lcDispensingDept[9];	/*摆药单位*/
@@ -1729,7 +1707,10 @@ int bill_drug_dispense()
 		double		lnBillCosts;			/*费用*/
 		double		lnBillCharges;			/*应收费用*/
 	EXEC SQL END DECLARE SECTION;           
-	
+	/*处理药品代码长度*/
+	drug_code_length=get_column_length("DRUG_DISPENSE_REC","PHARMACY","DRUG_CODE");//摆药记录
+	lcDrugCode=allocate_item_code(drug_code_length);
+
 	/*选择该病人所有未记价的摆药单*/
 	EXEC SQL DECLARE drug_dispense_rec_cursor CURSOR
 			FOR  SELECT DISPENSARY,TO_CHAR(DISPENSING_DATE_TIME,'YYYY-MM-DD HH24:MI'),
@@ -1752,6 +1733,7 @@ int bill_drug_dispense()
 	while (1)
 		{
 		/*取一条摆药记录*/
+		lcDrugCode->len=drug_code_length+1;//带截止符
 		EXEC SQL FETCH drug_dispense_rec_cursor  INTO
 					:lcDispensingDept,:lcDispensingDT,
 					:lcDrugCode,:lcDrugSpec,:lcDrugUnits,
@@ -1761,6 +1743,7 @@ int bill_drug_dispense()
 				{
 				/*摆药记录处理完毕*/
 				EXEC SQL CLOSE drug_dispense_rec_cursor;
+				free(lcDrugCode);
                 return(0);
 				}
 			else
@@ -1772,7 +1755,7 @@ int bill_drug_dispense()
 				}
 		lcDispensingDept.arr[lcDispensingDept.len]='\0';
 		lcDispensingDT.arr[lcDispensingDT.len]='\0';
-		lcDrugCode.arr[lcDrugCode.len]='\0';
+		lcDrugCode->arr[lcDrugCode->len]='\0';
 		lcDrugSpec.arr[lcDrugSpec.len]='\0';
         
 		/*取药品价格*/
@@ -1792,7 +1775,7 @@ int bill_drug_dispense()
 				{
 				/*价表中无对应的计价项目*/
 				fprintf(errfp,"病人ID:%s\n",gcPatientID.arr);
-				fprintf(errfp,"未找到药品 %s 价格\n",lcDrugCode.arr);
+				fprintf(errfp,"未找到药品 %s 价格\n",lcDrugCode->arr);
 				return(1);
 				}
 			else
@@ -1922,10 +1905,14 @@ int bill_labs()
 	EXEC SQL BEGIN DECLARE SECTION;  
 		VARCHAR		lcTestNo[11];			/*检验单申请序号*/
 		VARCHAR		lcRequestedDT[17];		/*申请时间及日期*/
-		VARCHAR		lcLabItemCode[11];		/*检验项目代码*/
+//		VARCHAR		lcLabItemCode[11];		/*检验项目代码*/
+		VARCHAR		*lcLabItemCode;			/*检验项目代码,wangjun*/
+		short		lab_item_code_length;	/*检验项目代码长度*/
 		VARCHAR		lcChgItemClass[2];		/*对应的收费项目类别*/
 		short		ind_ChgItemClass;		/*指示变量*/
-		VARCHAR		lcChgItemCode[11];		/*对应的收费项目代码*/
+//		VARCHAR		lcChgItemCode[11];		/*对应的收费项目代码*/
+		VARCHAR		*lcChgItemCode;			/*对应的收费项目代码指针,wangjun*/
+		short		chg_item_code_length;	/*对应的收费项目代码长度,wangjun*/
 		short		ind_ChgItemCode;		/*指示变量*/
 		VARCHAR		lcChgItemSpec[21];		/*对应的收费项目规格*/
 		short		ind_ChgItemSpec;		/*指示变量*/
@@ -1952,7 +1939,12 @@ int bill_labs()
 		double		lnLabCharges;			/*该检验单的应收费用*/
 	EXEC SQL END DECLARE SECTION;
 
+	/*得到item_code长度*/
+	lab_item_code_length=get_column_length("LAB_TEST_ITEMS","LAB","ITEM_CODE");
+	lcLabItemCode=allocate_item_code(lab_item_code_length);
 
+	chg_item_code_length=get_column_length("CLINIC_VS_CHARGE","COMM","CHARGE_ITEM_CODE");
+	lcChgItemCode=allocate_item_code(chg_item_code_length);
 	/*选出该病人所有未计价的检验单*/
 	EXEC SQL DECLARE lab_test_cursor CURSOR 
 		FOR  SELECT test_no,performed_by,
@@ -1979,6 +1971,8 @@ int bill_labs()
 			if (sqlca.sqlcode==1403)
 				{
 				/*检验单处理完毕*/
+				free(lcLabItemCode);
+				free(lcChgItemCode);
 				EXEC SQL CLOSE lab_test_cursor;
 				return(0);
 				}
@@ -2012,6 +2006,7 @@ int bill_labs()
 		while (1)
 			{
 			/*取一检验项目*/
+			lcLabItemCode->len=lab_item_code_length+1;//带截止符
 			EXEC SQL FETCH lab_test_items_cursor INTO
 						:lcLabItemCode;
 			if (sqlca.sqlcode!=0)
@@ -2042,7 +2037,7 @@ int bill_labs()
                 	EXEC SQL CLOSE lab_test_cursor;
 					return(-1);
 					}
-			lcLabItemCode.arr[lcLabItemCode.len]='\0';
+			lcLabItemCode->arr[lcLabItemCode->len]='\0';
 
 			/*取对应的收费项目*/
 			EXEC SQL DECLARE charge_items_cursor CURSOR 
@@ -2063,6 +2058,7 @@ int bill_labs()
 			while (1)
 				{
 				/*取一收费项目*/
+				lcChgItemCode->len=chg_item_code_length+1;
 				EXEC SQL FETCH charge_items_cursor INTO
 							:lcChgItemClass:ind_ChgItemClass,
 							:lcChgItemCode:ind_ChgItemCode,
@@ -2091,7 +2087,7 @@ int bill_labs()
 				if (ind_ChgAmount == -1 ) lnChgAmount = 1;		/*如果数量为空，默认为1*/
 
 				lcChgItemClass.arr[lcChgItemClass.len]='\0';
-				lcChgItemCode.arr[lcChgItemCode.len]='\0';
+				lcChgItemCode->arr[lcChgItemCode->len]='\0';
 				lcChgItemSpec.arr[lcChgItemSpec.len]='\0';
 
 				/*取检验价格*/
@@ -2111,7 +2107,7 @@ int bill_labs()
 						{
 						/*价表中无对应的计价项目*/
 						fprintf(errfp,"病人ID:%s\n",gcPatientID.arr);
-						fprintf(errfp,"未找到检验 %s 价格\n",lcChgItemCode.arr);
+						fprintf(errfp,"未找到检验 %s 价格\n",lcChgItemCode->arr);
 						return(1);
 						}
 					else
@@ -2223,7 +2219,6 @@ int bill_labs()
 		}	/*检验单*/
 }	/*end of bill_labs()*/
 
-
 /********************************************************************
  int bill_misc()
  名称: 杂费计价函数
@@ -2238,7 +2233,10 @@ int bill_misc()
 		/* 配置变量 */
 		VARCHAR		lcItemClass[11];		/*计价项目类别*/
 		short		ind_item_class;			/*指示变量*/
-		VARCHAR		lcItemCode[11];			/*计价项目代码*/  
+//		VARCHAR		lcItemCode[11];			/*计价项目代码*/  
+//		VARCHAR		lcItemCode[41];			/*计价项目代码*/  
+		VARCHAR		*lcItemCode;			/*计价项目代码,wangjun*/
+		short		item_code_length;		/*计价项目代码的长度,wangjun*/
 		short		ind_item_code;			/*指示变量*/ 
 		VARCHAR		lcItemSpec[21];			/*计价项目规格*/
 		short		ind_item_spec;			/*指示变量*/
@@ -2264,6 +2262,9 @@ int bill_misc()
 		double		lnCharges;				/*项目应收费用*/
 	EXEC SQL END DECLARE SECTION;
 
+	/*处理item_code长度*/
+	item_code_length=get_column_length("BILL_MISC_ITEM","INPBILL","ITEM_CODE");
+	lcItemCode=allocate_item_code(item_code_length);//长度初始化,截止符已处理完
 
 	/*如果为首次计价，以病人入院日期作为起始日期，否则，以上次计价日期作为起始日期*/
 	strncpy(lcMinDate.arr,gcAdmissionDateTime.arr,10);
@@ -2312,7 +2313,8 @@ int bill_misc()
 		}
 
 	while(1)
-		{ 
+		{
+		lcItemCode->len=item_code_length+1;
 		EXEC SQL FETCH misc_cursor INTO :lcItemClass:ind_item_class,
 					:lcItemCode:ind_item_code,:lcItemSpec:ind_item_spec;
 		if (sqlca.sqlcode!=0)
@@ -2339,7 +2341,7 @@ int bill_misc()
 			}
 		
 		lcItemClass.arr[lcItemClass.len]='\0';
-		lcItemCode.arr[lcItemCode.len]='\0';
+		lcItemCode->arr[lcItemCode->len]='\0';
 		lcItemSpec.arr[lcItemSpec.len]='\0';
 
 		/*取项目价格*/
@@ -2355,7 +2357,7 @@ int bill_misc()
 				{
 				/*价表中无对应的计价项目*/
 				fprintf(errfp,"病人ID:%s\n",gcPatientID.arr);
-				fprintf(errfp,"未找到杂费 %s %s 价格\n",lcItemClass.arr,lcItemCode.arr);
+				fprintf(errfp,"未找到杂费 %s %s 价格\n",lcItemClass.arr,lcItemCode->arr);
 				EXEC SQL CLOSE misc_cursor;
 				return(1);
 				}
@@ -2432,7 +2434,7 @@ int bill_misc()
 			{
 			if (loglevel>0)
 				fprintf(fp,"\n   **杂费天数=%5.2f  杂费项目=%s %s %s 金额=%5.2f 应收=%5.2f\n",
-				lnMiscDays,lcItemClass.arr,lcItemCode.arr,lcItemSpec.arr,lnCosts,lnCharges) ;
+				lnMiscDays,lcItemClass.arr,lcItemCode->arr,lcItemSpec.arr,lnCosts,lnCharges) ;
 			
 			if (ind_PB == -1)			/*价表执行科室为空或者为多执行科室,取病人所在科室为执行科室*/
 				{
@@ -2467,6 +2469,7 @@ int bill_misc()
 				}
 			}
 		}   /*while*/
+	free(lcItemCode);
 	return(0);
 } /*end of bill_misc*/
 
@@ -2716,13 +2719,19 @@ int   IsRemark(char *pString)
         或
        rem ＣＯＭＭＥＮＴ  ＬＩＮＥ
 返回值：如果字符串pString为一注释，则返回值１，否则返回值  －１
-
+修订:宏注释处理,strncasecmp,linux
 ***********************************/
 int IsRemark(char *pString)
 {
   int len;
+  int wangjun_ncase_result=-1;
   len=strlen(pString);
-  if((len>3&&strnicmp("rem",pString,3)==0)||*pString==';')
+  #ifdef _WIN32
+	  wangjun_ncase_result=strnicmp("rem",pString,3);//for windows
+  #else
+	  wangjun_ncase_result=strncasecmp("rem",pString,3);//for linux
+  #endif
+  if((len>3&&wangjun_ncase_result==0)||*pString==';')
      return 1;     
   else
     return -1;
@@ -2780,6 +2789,7 @@ int GetConfigNum(char *FileName,char *pSection,
 功能：根据参数表的参数来获取设置变量值。
 返回值：返回所搜索的变量的设置值（整数），如配置文件中没有设置，则返回
         缺省设置值。
+修改: 1.wangjun:处理itoa,以支持Linux.
 ***********************************************************************/
           
 int GetConfigNum(char *FileName,char *pSection,char *pItemKey,int nValueDefault)
@@ -2789,7 +2799,11 @@ int GetConfigNum(char *FileName,char *pSection,char *pItemKey,int nValueDefault)
   char pValueBuffer[MAXSIZE];
   pValueBuffer[0]='\0';
   pBuffer[0]='\0';
-  itoa(nValueDefault,pValueBuffer,10);
+  #ifdef _WIN32
+	itoa(nValueDefault,pValueBuffer,10);//10,表示10进制
+  #else
+	sprintf(pValueBuffer,"%d",nValueDefault);
+  #endif
   GetConfigString(FileName,pSection,pItemKey,pValueBuffer,pBuffer,MAXSIZE-1);
   return atoi(pBuffer);
 }
@@ -2806,7 +2820,7 @@ char *GetConfigString(char *FileName,char *pSection,char *pItemKey,
 功能：根据参数表的参数来获取设置变量值（字符串值）。
 返回值：返回所搜索的变量的设置值（整数），如配置文件中没有设置，则返回
         缺省设置值。
-
+修改：宏定义改为strcasecmp,适应Linux.
 **********************************************************************/
 char *GetConfigString(char *FileName,char *pSection,char *pItemKey,
                       char *pValueDefault,char *pBuffer,int nBufferSize)
@@ -2816,19 +2830,26 @@ char *GetConfigString(char *FileName,char *pSection,char *pItemKey,
   int nSecFound=0;//control search for section
   int nKeyFound=0;//control search for itemkey
   int i=0; //control search order:section first ,itemkey second
+  int wangjun_case_result=-1;
+  int wangjun_ncase_result=-1;
+  int flag=-1;//file format
+  int cnt_line_read=-1;
+
   char aLineBuffer[MAXLINE];//save the line getted from file
   char aBuffer[MAXLINE];    //buffer for call other functions
   aLineBuffer[0]='\0';
   aBuffer[0]='\0';
   pBuffer[0]='\0';
-  cfp=fopen(FileName,"r");
+  cfp=fopen(FileName,"rb");
   if(cfp==NULL) //open config_file
      {   
+		 //printf("Not open%s\n",FileName);
          strcpy(pBuffer,pValueDefault);
          return pBuffer;
      }
+  flag=file_format(cfp);
   while(1){
-    if(fgets(aLineBuffer,MAXLINE-1,cfp)==NULL) //eof of file
+    if(fgets(aLineBuffer,MAXLINE-1,cfp)==NULL) //eof of file,fgets will not stop if it encounters '\r'
       {  
          fclose(cfp);
          strcpy(pBuffer,pValueDefault);
@@ -2836,10 +2857,36 @@ char *GetConfigString(char *FileName,char *pSection,char *pItemKey,
       }
     else
       {
-        aLineBuffer[strlen(aLineBuffer)-1]='\0';	/*去掉换行符*/
+		//printf("\ni=%d,aLineBuffer(%d):\"%s\",\naBuffer:\"%s\"\n",i,strlen(aLineBuffer),aLineBuffer,aBuffer);	
+		//去除换行符
+		//fgets(aLineBuffer,MAXLINE-1,cfp);
+		switch(flag)
+		{
+			case 1://win
+				aLineBuffer[strlen(aLineBuffer)-2]='\0';
+				break;
+			case 2://linux
+				aLineBuffer[strlen(aLineBuffer)-1]='\0';
+				break;
+			case 3://mac
+				cnt_line_read=strlen(aLineBuffer);
+				printf("Could not process mac file format.Continue.\n");
+				for(i=0;i<cnt_line_read;i++)
+				{
+					if(aLineBuffer[i]=='\r')
+						aLineBuffer[i]='\0';
+				}
+				//aLineBuffer[strlen(aLineBuffer)-1]='\0';
+				break;
+			//case 0://other,do not process
+		}
+//		printf("Remove return carriage,aLineBuffer(%d):-1=\'%c\'\naLineBuffer(%d):\"%s\"\n",strlen(aLineBuffer)	,aLineBuffer[strlen(aLineBuffer)-1],strlen(aLineBuffer),aLineBuffer);
         Trima(aLineBuffer,aBuffer,MAXLINE-1);
-        strcpy(aLineBuffer,aBuffer);
+//		printf(" After Trima,aLineBuffer(%d):\"%s\"\n aBuffer(%d):\"%s\"\n",strlen(aLineBuffer),aLineBuffer, strlen(aBuffer),aBuffer);
+        strcpy(aLineBuffer,aBuffer);	
+//		printf("\tAfter strcpy,aLineBuffer(%d):\"%s\"\n\taBuffer(%d):\"%s\"\n",strlen(aLineBuffer),aLineBuffer,	strlen(aBuffer),aBuffer);
       }
+
      switch (i) {
      // i=0:search for section
      case 0: 
@@ -2847,8 +2894,14 @@ char *GetConfigString(char *FileName,char *pSection,char *pItemKey,
              {
                 //aBuffer[0]='\0';
                 MultiCat(aBuffer,MAXLINE-1,"[",pSection,"]",(char *)NULL);
-                if (strnicmp(aLineBuffer,aBuffer,strlen(aBuffer))==0)
-                   {
+				#ifdef _WIN32
+					wangjun_ncase_result=strnicmp(aLineBuffer,aBuffer,strlen(aBuffer));
+				#else
+					wangjun_ncase_result=strncasecmp(aLineBuffer,aBuffer,strlen(aBuffer));
+				#endif					
+                if (wangjun_ncase_result==0)
+                   {			
+						//printf("found section.\n");
                       nSecFound=1;
                       i=1;
                    } 
@@ -2865,8 +2918,14 @@ char *GetConfigString(char *FileName,char *pSection,char *pItemKey,
              {
                 //aBuffer[0]='\0';
                 LSubs(aLineBuffer,'=',0,aBuffer,MAXLINE-1);
-                if (stricmp(aBuffer,pItemKey)==0)
+				#ifdef _WIN32
+					wangjun_case_result=stricmp(aBuffer,pItemKey);
+				#else
+					wangjun_case_result=strcasecmp(aBuffer,pItemKey);
+				#endif
+				if (wangjun_case_result==0)
                    {
+						//printf("found key.\n");
                       nKeyFound=1;
                       i=2;
                    }
@@ -2895,7 +2954,7 @@ char *GetConfigString(char *FileName,char *pSection,char *pItemKey,
 } //end of function (GetConfigString)
 
 /*********************************************************************
-void LSubs(char *pString,char ch,int nMode,char *pBuffer,int nBufferSize);
+void RSubs(char *pString,char ch,int nMode,char *pBuffer,int nBufferSize);
 名称：取字符串右边子串函数
 参数表：pString 待处理字符串指针      
         ch      用于搜索的字符
@@ -3031,7 +3090,7 @@ char *RTrim(char *pString,char *pBuffer,int nBufferSize)
 }
 
 /***********************************************************
-void Trima(char *pString,char *pBuffer,int nBufferSize) 
+char* Trima(char *pString,char *pBuffer,int nBufferSize) 
 名称：字符串过滤函数
 参数表：pString 待处理字符串指针      
         pBuffer 存放返回值的缓冲区
@@ -3071,6 +3130,7 @@ int GetConfigMisc(char *FileName,char *pSection,int nItemNo,
 
 {
   FILE *fp;
+  int wangjun_ncase_result=-1;
   int nSecFound=0;//control search for section
   int nItemFound=1; //for comparing the nItemNo & nItemFound
                    // if nItemFound==nItemNo means the line has been found
@@ -3105,7 +3165,12 @@ int GetConfigMisc(char *FileName,char *pSection,int nItemNo,
              {
                 //aBuffer[0]='\0';
                 MultiCat(aBuffer,MAXLINE-1,"[",pSection,"]",(char *)NULL);
-                if (strnicmp(aLineBuffer,aBuffer,strlen(aBuffer))==0)
+				#ifdef _WIN32
+					wangjun_ncase_result=strnicmp(aLineBuffer,aBuffer,strlen(aBuffer));
+				#else
+					wangjun_ncase_result=strncasecmp(aLineBuffer,aBuffer,strlen(aBuffer));
+				#endif
+                if (wangjun_ncase_result==0)
                    {
                       nSecFound=1;
                       i=1;
@@ -3197,101 +3262,190 @@ int SetConfigStr(char *FileName,char *pSection,char *pItemKey,
 ***********************************************************************/
 int SetConfigString(char *FileName,char *pSection,char *pItemKey,char *pItemValue)
 {
-char *tmpxxx="tmpconf";//temp file for writen
-FILE *fp,*fp1;
-int nSecFound=0; //use for search sucessed or no
-int nItemFound=0; //use for search sucessed or no
+	char *tmpxxx="tmpconf";//temp file for writen
+	FILE *fp,*fp1;
+	int nSecFound=0; //use for search sucessed or no
+	int nItemFound=0; //use for search sucessed or no
+	int wangjun_case_result=-1;//use for character compare result
+	int wangjun_ncase_result=-1;
 
-int i=0;    //i is used for search control
-char aLineBuffer[MAXLINE];
-char aBuffer[MAXLINE];
-aLineBuffer[0]='\0';
-aBuffer[0]='\0';
-if( (fp=fopen(FileName,"r")) == NULL){
-   return(-1);
-   }
-if((fp1=fopen(tmpxxx,"wt"))==NULL){
-   fclose(fp);
-   return(-1);
-   }
-while(1){
-    if(fgets(aLineBuffer,MAXLINE-1,fp)==NULL) 
-       {
-         if(nSecFound==0)//not find such pSection
-           {
-              MultiCat(aBuffer,MAXLINE-1,"[",pSection,"]\n",(char *)NULL);
-              fputs(aBuffer,fp1);
-              MultiCat(aBuffer,MAXLINE-1,pItemKey,"=",pItemValue,"\n",(char *)NULL);
-              fputs(aBuffer,fp1);
-           }
-         else if (nItemFound==0)
-            {
-              MultiCat(aBuffer,MAXLINE-1,pItemKey,"=",pItemValue,"\n",(char *)NULL);
-              fputs(aBuffer,fp1);
-            }
-         fclose(fp);
-         fclose(fp1);
-         remove(FileName);
-         rename(tmpxxx,FileName);
-         return(0) ;
-       };
-     aLineBuffer[strlen(aLineBuffer)-1]='\0';	/*去掉换行符*/
-     switch (i) {
-     // search for pSection
-     case 0: 
-          fputs(aLineBuffer,fp1);
-          fputs("\n",fp1);
-          if (IsSection(aLineBuffer)==1)
-             {
-               MultiCat(aBuffer,MAXLINE-1,"[",pSection,"]",(char *)NULL);
-               if (strnicmp(aLineBuffer,aBuffer,strlen(aBuffer))==0)
-                  {
-                     nSecFound=1;  // pSection has found
-                     i=1;          //i=1 means will search for varkey
-                  }
-             }
-          break;
-          // search for pItemKey
-     case 1: 
-          if (IsKeyValue(aLineBuffer)==1)
-             {
-                LSubs(aLineBuffer,'=',0,aBuffer,MAXLINE-1);
-                if (stricmp(pItemKey,aBuffer)==0)
-                   {
-                      MultiCat(aBuffer,MAXLINE-1,pItemKey,"=",pItemValue,"\n",(char *)NULL);
-                      fputs(aBuffer,fp1);
-                      nItemFound=1;
-                      i=2;//means pItemKey set has been completed! 
-                   } 
-                else
-                   {
-                   fputs(aLineBuffer,fp1);
-                   fputs("\n",fp1);
-                   }
-             }
-          else if(IsSection(aLineBuffer)==1)
-               //is next pSection ,add new line
-               { 
-                  MultiCat(aBuffer,MAXLINE-1,pItemKey,"=",pItemValue,"\n",(char *)NULL);
-                  fputs(aBuffer,fp1);
-                  fputs(aLineBuffer,fp1);
-                  fputs("\n",fp1);
-                  nItemFound=1;
-                  i=2;  //set have been completed!
-               }
-               else //remark line
-                 {
-                 fputs(aLineBuffer,fp1);
-                 fputs("\n",fp1);
-                 }
-          break;
-     default:
-          fputs(aLineBuffer,fp1);
-          fputs("\n",fp1);
-          break;
-     } //end of switch statement
-   }      // end of while
+	int i=0;    //i is used for search control
+	char aLineBuffer[MAXLINE];
+	char aBuffer[MAXLINE];
+	aLineBuffer[0]='\0';
+	aBuffer[0]='\0';
+	if( (fp=fopen(FileName,"r")) == NULL){
+	   return(-1);
+	   }
+	if((fp1=fopen(tmpxxx,"wt"))==NULL){
+	   fclose(fp);
+	   return(-1);
+	   }
+	while(1){
+		if(fgets(aLineBuffer,MAXLINE-1,fp)==NULL) 
+		   {
+			 if(nSecFound==0)//not find such pSection
+			   {
+				  MultiCat(aBuffer,MAXLINE-1,"[",pSection,"]\n",(char *)NULL);
+				  fputs(aBuffer,fp1);
+				  MultiCat(aBuffer,MAXLINE-1,pItemKey,"=",pItemValue,"\n",(char *)NULL);
+				  fputs(aBuffer,fp1);
+			   }
+			 else if (nItemFound==0)
+				{
+				  MultiCat(aBuffer,MAXLINE-1,pItemKey,"=",pItemValue,"\n",(char *)NULL);
+				  fputs(aBuffer,fp1);
+				}
+			 fclose(fp);
+			 fclose(fp1);
+			 remove(FileName);
+			 rename(tmpxxx,FileName);
+			 return(0) ;
+		   };
+		 aLineBuffer[strlen(aLineBuffer)-1]='\0';	/*去掉换行符*/
+		 switch (i) {
+		 // search for pSection
+		 case 0: 
+			  fputs(aLineBuffer,fp1);
+			  fputs("\n",fp1);
+			  if (IsSection(aLineBuffer)==1)
+				 {
+				   MultiCat(aBuffer,MAXLINE-1,"[",pSection,"]",(char *)NULL);
+				   #ifdef _WIN32
+					   wangjun_ncase_result=strnicmp(aLineBuffer,aBuffer,strlen(aBuffer));
+				   #else
+					   wangjun_ncase_result=strncasecmp(aLineBuffer,aBuffer,strlen(aBuffer));
+				   #endif					  
+				   if (wangjun_ncase_result==0)
+					  {
+						 nSecFound=1;  // pSection has found
+						 i=1;          //i=1 means will search for varkey
+					  }
+				 }
+			  break;
+			  // search for pItemKey
+		 case 1: 
+			  if (IsKeyValue(aLineBuffer)==1)
+				 {
+					LSubs(aLineBuffer,'=',0,aBuffer,MAXLINE-1);
+			#ifdef _WIN32
+				wangjun_case_result=stricmp(pItemKey,aBuffer);//for windows
+			#else
+				wangjun_case_result=strcasecmp(pItemKey,aBuffer);//for linux
+			#endif
+			if (wangjun_case_result==0)
+					   {
+						  MultiCat(aBuffer,MAXLINE-1,pItemKey,"=",pItemValue,"\n",(char *)NULL);
+						  fputs(aBuffer,fp1);
+						  nItemFound=1;
+						  i=2;//means pItemKey set has been completed! 
+					   } 
+					else
+					   {
+					   fputs(aLineBuffer,fp1);
+					   fputs("\n",fp1);
+					   }
+				 }
+			  else if(IsSection(aLineBuffer)==1)
+				   //is next pSection ,add new line
+				   { 
+					  MultiCat(aBuffer,MAXLINE-1,pItemKey,"=",pItemValue,"\n",(char *)NULL);
+					  fputs(aBuffer,fp1);
+					  fputs(aLineBuffer,fp1);
+					  fputs("\n",fp1);
+					  nItemFound=1;
+					  i=2;  //set have been completed!
+				   }
+				   else //remark line
+					 {
+					 fputs(aLineBuffer,fp1);
+					 fputs("\n",fp1);
+					 }
+			  break;
+		 default:
+			  fputs(aLineBuffer,fp1);
+			  fputs("\n",fp1);
+			  break;
+		 } //end of switch statement
+	   }      // end of while
 
 }  // end of function
 
+/**********************************
+功能：根据文件指针第一行的回车换行符,返回文件格式.win,lnx,mac,other
+返回值：1,Windows file format; 
+		2,Linux file format;
+		3,mac file format;
+		0,other file format.
+***********************************/
+int file_format(FILE *cfp)
+{
+	char aLineBuffer[MAXLINE];
+	int flag=0;
+	int file_pos;
+	if(cfp!=NULL)
+	{
+		file_pos=ftell(cfp);
+		fgets(aLineBuffer,MAXLINE-1,cfp);
+		if(aLineBuffer[strlen(aLineBuffer)-2]=='\r'&&aLineBuffer[strlen(aLineBuffer)-1]=='\n')
+		{
+			//printf("Windows file format\n");
+			flag=1;
+		}
+		else if(aLineBuffer[strlen(aLineBuffer)-1]=='\n')
+		{
+			//printf("Linux file format.\n");
+			flag=2;
+		}
+		else if(aLineBuffer[strlen(aLineBuffer)-1]=='\r')
+		{
+			//printf("Mac file format.\n");
+			flag=3;
+		}
+		else
+		{
+			//printf("Other file format.\n");
+			flag=0;
+		}
+		fseek(cfp,file_pos,SEEK_SET);
+	}
+	return flag;
+}
 
+/*查询dba_tab_cols表字段的长度并返回
+改进到sql变量,以便Windows下能不使用proc的parse=full编译通过.
+*/
+short get_column_length(char *table_name,char *owner,char *column_name)
+{
+	EXEC SQL BEGIN DECLARE SECTION;
+	/*运行变量*/
+	VARCHAR		*vc_table_name;
+	VARCHAR		*vc_owner;
+	VARCHAR		*vc_column_name;
+	short		ln_data_length;	/*查询字段的长度*/
+	EXEC SQL END DECLARE SECTION;
+
+
+	vc_table_name=(VARCHAR *)malloc(sizeof(short)*(strlen(table_name)+1) );//strlen不包含null terminator.所以长度要加1
+	strcpy(vc_table_name->arr,table_name);
+	vc_table_name->len=strlen(table_name);	vc_table_name->arr[vc_table_name->len]='\0';
+
+	vc_owner=(VARCHAR *)malloc(sizeof(short)*(strlen(owner)+1) );
+	strcpy(vc_owner->arr,owner);
+	vc_owner->len=strlen(owner);	vc_owner->arr[vc_owner->len]='\0';
+
+	vc_column_name=(VARCHAR *)malloc(sizeof(short)*(strlen(column_name)+1) );
+	strcpy(vc_column_name->arr,column_name);
+	vc_column_name->len=strlen(column_name);	vc_column_name->arr[vc_column_name->len]='\0';
+
+	EXEC SQL select DATA_LENGTH into :ln_data_length
+		from dba_tab_cols dtc where dtc.table_name=upper(:vc_table_name) and dtc.owner=upper(:vc_owner) and dtc.column_name=upper(:vc_column_name);
+
+	free(vc_table_name);
+	free(vc_owner);
+	free(vc_column_name);
+	if (sqlca.sqlcode!=0)
+		return -1;
+	else
+		return ln_data_length;
+} 

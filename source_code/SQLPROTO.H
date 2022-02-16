@@ -28,7 +28,7 @@
 #ifndef SQLPROTO
 #  define SQLPROTO
 
-#include "sqlda.h"
+#include "SQLDA.H"
 
 #ifdef __IBMC__
 #   define FAR

@@ -1,0 +1,40 @@
+2022年2月15日
+修订get_column_length(),使用指针VARCHAR*,简化Windows下proc问题.proc parse=none即可.不再需要parse=full。
+
+2022年2月14日
+替换3个windowsapi，itoa()，stricmp()，strnicmp()
+扩展BACKBILL.INI文件格式,原支持\r\n,扩展支持Linux下回车符\n.暂不支持mac的换行符\r.
+支持Linux Oracle 11g 64bit运行.
+1.处理3个Windowsapi，itoa,stritoa,stricmp,strnicmp,替换为sprintf,strcasecmp,strncasecmp.兼容Linux.
+2.增加file_format函数,以判断传入的ini文件格式.
+3.修正GetConfigString,以支持Windows、Linux(represented by win、lnx repectively)的文件格式.
+	Windows换行符\r\n, 扩展支持Linux下回车符\n.
+	ini处理文件暂不支持mac的回车符\r.
+4.SQLCON.H修改格式为linux换行符.
+
+2022年2月10日
+以下表的字段,程序为自适应大小.
+bill_misc_item,item_code;
+
+2022年2月7日
+backbill_o10g.exe,编译为win32程序,环境oracle10g 32位。
+backbill_o11g.exe,编译为win32程序,环境oracle11g 32位。
+
+2022年2月2日
+以下6个表的字段,程序为自适应大小.
+bed_rec,bed_class;
+orders_costs,item_code;
+price_list,item_code;
+drug_dispense_rec,drug_code;
+lab_test_items,item_code;
+clinic_vs_charge,charge_item_code.
+注意:bed_class_dict,bed_class_code与bed_rec,bed_class有关.但程序不处理表bed_class_dict.
+
+2022年1月12日
+调整了bed_rec的bed_class字段为40字节；调整price_list的item_code字段为40字节。
+
+2022年1月7日
+估计基于backbill的1998年10月8日开发。
+1.能在win下编译运行。环境oracle10g32位。
+2.bill_source增加参数bed_first_day_mode，首次计价时，床位费天数计数模式:0,不计价,即floor； 1,按小数0.x天计价； 2,按整数1天计价,即ceil。
+非首次计价时，按照floor模式计算。刚好是1天间隔。
